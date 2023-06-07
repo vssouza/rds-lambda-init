@@ -7,6 +7,7 @@ import * as customResources from 'aws-cdk-lib/custom-resources';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import { Construct } from 'constructs';
 
+import * as path from 'path';
 import { createHash } from 'crypto';
 
 export interface CdkResourceInitializerProps {
@@ -96,7 +97,7 @@ export class RdsLambdaInitStack extends cdk.Stack {
     super(scope, id, props);
 
     // VPC that shouldn't have internet access (DB, Proxy, Init lambda)
-    const rdsInitVPpc = new ec2.Vpc(this, 'rdsInitVpc', {
+    const rdsInitVpc = new ec2.Vpc(this, 'rdsInitVpc', {
       maxAzs: 2,
       vpcName: 'rdsInitVpc',
       subnetConfiguration: [{
@@ -110,13 +111,15 @@ export class RdsLambdaInitStack extends cdk.Stack {
     // Security group for the resources DB Resources
     const rdsInitSecurityGroup = new ec2.SecurityGroup(this, 'rdsInitSecurityGroup', {
       securityGroupName: 'rdsInitSecurityGroup',
-      vpc: rdsInitVPpc
+      vpc: rdsInitVpc
     });
 
     const rdsInitPgDbSecret = new rds.DatabaseSecret(this, 'rdsInitPgDbSecret', {
       username: 'postgres',
       secretName: 'rdsInitPgDbSecret'
     });
+
+    const databaseName = 'rds_init_pg_db';
 
     // Postgres database instance creation
     const rdsInigPgDb = new rds.DatabaseInstance(this, 'rdsInigPgDb', {
@@ -130,12 +133,12 @@ export class RdsLambdaInitStack extends cdk.Stack {
         ec2.InstanceClass.BURSTABLE3,
         ec2.InstanceSize.SMALL
       ),
-      vpc: rdsInitVPpc,
-      vpcSubnets: rdsInitVPpc.selectSubnets({
+      vpc: rdsInitVpc,
+      vpcSubnets: rdsInitVpc.selectSubnets({
         subnetType: ec2.SubnetType.PRIVATE_ISOLATED
       }),
       multiAz: false,
-      databaseName: 'rds_init_pg_db',
+      databaseName,
       securityGroups: [ rdsInitSecurityGroup ],
       //TODO: This must retrieve from the secrets manager group without using NAT
       credentials: rds.Credentials.fromSecret(rdsInitPgDbSecret),
@@ -153,9 +156,9 @@ export class RdsLambdaInitStack extends cdk.Stack {
       //TODO: This must retrieve from the secrets manager group without using NAT
       secrets: [ rdsInitPgDbSecret ],
       securityGroups: [ rdsInitSecurityGroup ],
-      vpc: rdsInitVPpc,
+      vpc: rdsInitVpc,
       requireTLS: false,
-      vpcSubnets: rdsInitVPpc.selectSubnets({
+      vpcSubnets: rdsInitVpc.selectSubnets({
         subnetType: ec2.SubnetType.PRIVATE_ISOLATED
       })
     });
@@ -163,9 +166,23 @@ export class RdsLambdaInitStack extends cdk.Stack {
     // DB proxy creation depends on the database creation
     rdsInitPgDbProxy.node.addDependency(rdsInigPgDb);
 
-    // Lambda to startup DB structure
+    // Resource to startup DB structure
+    const dbInitResource = new DBInitResource(this, 'dbInitResource', {
+      fnLogRetention: log.RetentionDays.ONE_DAY,
+      fnCode: lambda.DockerImageCode.fromImageAsset(path.join(__dirname, '/../src/lambda/db')),
+      fnTimeout: cdk.Duration.minutes(2),
+      fnSecurityGroups: [ rdsInitSecurityGroup ],
+      vpc: rdsInitVpc,
+      subnetsSelection: rdsInitVpc.selectSubnets({subnetType: ec2.SubnetType.PRIVATE_ISOLATED}),
+      endpoint: rdsInitPgDbProxy.endpoint,
+      databaseName,
+      dbSecretArn: rdsInigPgDb.secret?.secretFullArn || ''
+    });
 
+    // Node dependencies and connection port access config
+    rdsInigPgDb.secret?.grantRead(dbInitResource.function);
+    dbInitResource.node.addDependency(rdsInitPgDbProxy);
+    rdsInitPgDbProxy.connections.allowFrom(dbInitResource.function, ec2.Port.tcp(5432));
 
-    
   }
 }
